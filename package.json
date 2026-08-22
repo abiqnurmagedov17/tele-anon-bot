@@ -1,0 +1,9 @@
+{
+  "name": "tele-anon-bot",
+  "version": "1.0.0",
+  "main": "api/index.js",
+  "dependencies": {
+    "@upstash/redis": "^1.28.0",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
