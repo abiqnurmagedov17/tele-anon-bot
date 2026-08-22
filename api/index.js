@@ -9,7 +9,7 @@ const bot = new TelegramBot(token);
 
 const WAITING_SET = 'waiting_users';
 const PAIRS_HASH = 'pairs';
-const SEARCH_MSG_HASH = 'search_msgs'; // Redis Hash untuk simpan ID pesan antrean: { userId: messageId }
+const SEARCH_MSG_HASH = 'search_msgs';
 
 const MAIN_KEYBOARD = {
   reply_markup: {
@@ -52,12 +52,11 @@ module.exports = async (req, res) => {
   const update = req.body;
   if (!update || !update.update_id) return res.status(200).send('OK');
 
-  // Deduplikasi Update ID
   const updateKey = `processed_update:${update.update_id}`;
   const isProcessed = await redis.set(updateKey, '1', { nx: true, ex: 86400 });
   if (!isProcessed) return res.status(200).send('OK');
 
-  // --- HANDLER 1: CALLBACK QUERY (Klik Tombol Inline) ---
+  // --- HANDLER CALLBACK QUERY (Tombol Klik) ---
   if (update.callback_query) {
     const cb = update.callback_query;
     const chatId = cb.message.chat.id.toString();
@@ -75,7 +74,7 @@ module.exports = async (req, res) => {
     } else if (action === 'cmd_next') {
       if (partnerId) {
         await cleanupPair(chatId, partnerId);
-        await bot.sendMessage(chatId, "🔄 <i>Obrolan dihentikan.</i>", { parse_mode: "HTML" });
+        await bot.sendMessage(chatId, "🔄 <i>Obrolan dihentikan. Mencari teman baru...</i>", { parse_mode: "HTML" });
         await notifyUserQuietly(partnerId, "🛑 <i>Teman bicara kamu meninggalkan obrolan.</i>", MAIN_KEYBOARD);
       } else {
         await handleCancelQueue(chatId);
@@ -85,7 +84,7 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK');
   }
 
-  // --- HANDLER 2: MESSAGE (Teks / Media) ---
+  // --- HANDLER MESSAGE ---
   const msg = update.message;
   if (!msg || !msg.chat || msg.chat.type !== 'private') return res.status(200).send('OK');
 
@@ -95,10 +94,18 @@ module.exports = async (req, res) => {
 
   if (text === '/start') {
     const welcomeMsg = 
-      "✨ <b>Selamat Datang di AnonChat Bot!</b> ✨\n\n" +
+      "✨ <b>Selamat Datang di AnonChat Bot!</b> ✨\n" +
+      "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
       "Ngobrol rahasia & anonim dengan pengguna lain secara acak.\n" +
-      "💡 <i>Identitas & foto profil kamu tidak akan terlihat.</i>\n\n" +
-      "Klik tombol di bawah untuk mencari pasangan:";
+      "💡 <i>Identitas, username, & foto profil kamu dijamin tidak akan terlihat.</i>\n\n" +
+      "📌 <b>Panduan & Fitur:</b>\n" +
+      "• 🎲 <b>Cari Teman</b> - Mulai mencari obrolan acak\n" +
+      "• 🔄 <b>Ganti Pasangan</b> - Pindah ke teman chat lain\n" +
+      "• 🛑 <b>Keluar Chat</b> - Mengakhiri obrolan saat ini\n\n" +
+      "👑 <b>Owner Bot:</b> @tatsukiray\n" +
+      "━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+      "Tekan tombol di bawah untuk mencari pasangan:";
+      
     await bot.sendMessage(chatId, welcomeMsg, MAIN_KEYBOARD);
   } else if (text === '/random') {
     await handleRandomMatch(chatId, partnerId);
@@ -107,7 +114,7 @@ module.exports = async (req, res) => {
   } else if (text === '/next') {
     if (partnerId) {
       await cleanupPair(chatId, partnerId);
-      await bot.sendMessage(chatId, "🔄 <i>Obrolan dihentikan.</i>", { parse_mode: "HTML" });
+      await bot.sendMessage(chatId, "🔄 <i>Obrolan dihentikan. Mencari teman baru...</i>", { parse_mode: "HTML" });
       await notifyUserQuietly(partnerId, "🛑 <i>Teman bicara kamu meninggalkan obrolan.</i>", MAIN_KEYBOARD);
     } else {
       await handleCancelQueue(chatId);
@@ -126,7 +133,7 @@ module.exports = async (req, res) => {
     } else {
       const isWaiting = await redis.sismember(WAITING_SET, chatId);
       if (isWaiting) {
-        await bot.sendMessage(chatId, "⏳ <i>Kamu masih dalam antrean...</i>", QUEUE_KEYBOARD);
+        await bot.sendMessage(chatId, "⏳ <i>Kamu masih dalam antrean pencarian.</i>", QUEUE_KEYBOARD);
       } else {
         await bot.sendMessage(chatId, "⚠️ <i>Kamu belum terhubung dengan siapa pun.</i>", MAIN_KEYBOARD);
       }
@@ -136,7 +143,7 @@ module.exports = async (req, res) => {
   return res.status(200).send('OK');
 };
 
-// --- LOGIKA MATCHMAKING DENGAN ANIMASI & DELETE MESSAGE ---
+// --- MATCHMAKING LOGIC ---
 
 async function handleRandomMatch(chatId, existingPartnerId) {
   if (existingPartnerId) {
@@ -145,9 +152,7 @@ async function handleRandomMatch(chatId, existingPartnerId) {
   }
 
   const isWaiting = await redis.sismember(WAITING_SET, chatId);
-  if (isWaiting) {
-    return;
-  }
+  if (isWaiting) return;
 
   let matchedUser = await redis.spop(WAITING_SET);
   if (matchedUser === chatId) matchedUser = await redis.spop(WAITING_SET);
@@ -155,14 +160,13 @@ async function handleRandomMatch(chatId, existingPartnerId) {
   if (matchedUser) {
     await redis.hset(PAIRS_HASH, { [chatId]: matchedUser, [matchedUser]: chatId });
 
-    // Hapus pesan "Mencari teman..." milik matchedUser jika ada
     await deleteSearchMessage(matchedUser);
 
     const matchText = 
       "🎉 <b>Pasangan Ditemukan!</b>\n" +
-      "━━━━━━━━━━━━━━━━━━━\n" +
-      "Silakan menyapa teman barumu. Jaga kesopanan!\n\n" +
-      "<i>Navigasi obrolan:</i>";
+      "━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+      "Silakan menyapa teman barumu. Jaga kesopanan & selamat mengobrol!\n\n" +
+      "👑 <i>Bot by @tatsukiray</i>";
 
     await bot.sendMessage(chatId, matchText, CHATTING_KEYBOARD);
     
@@ -173,21 +177,17 @@ async function handleRandomMatch(chatId, existingPartnerId) {
       await handleRandomMatch(chatId, null);
     }
   } else {
-    // Masukkan ke antrean
     await redis.sadd(WAITING_SET, chatId);
 
-    // Kirim pesan pencarian awal dengan emoji animasi/loading
+    // Animasi Text Loading Search
     const searchMsg = await bot.sendMessage(
       chatId, 
       "🔍 <b>Mencari teman obrolan</b> <code>.</code>\n<i>Mohon tunggu sebentar...</i>", 
       QUEUE_KEYBOARD
     );
 
-    // Simpan ID pesan agar bisa dihapus saat klik Batal
     await redis.hset(SEARCH_MSG_HASH, { [chatId]: searchMsg.message_id });
 
-    // Efek Animasi Teks (Simulasi titik bergerak secara dramatis)
-    // Menggunakan timeout singkat sebelum serverless Vercel membekukan instance
     setTimeout(async () => {
       try {
         await bot.editMessageText(
@@ -208,18 +208,12 @@ async function handleRandomMatch(chatId, existingPartnerId) {
   }
 }
 
-// Handler khusus Batal Antre -> HAPUS PESAN PENCARIAN
 async function handleCancelQueue(chatId) {
   await redis.srem(WAITING_SET, chatId);
-  
-  // Hapus pesan "Mencari teman obrolan..." dari layar chat
   await deleteSearchMessage(chatId);
-
-  // Kirim notifikasi baru bahwa antrean telah dibatalkan
   await bot.sendMessage(chatId, "❌ <i>Pencarian dibatalkan.</i>", MAIN_KEYBOARD);
 }
 
-// Handler Stop Chat
 async function handleStopChat(chatId, partnerId) {
   const isWaiting = await redis.sismember(WAITING_SET, chatId);
   if (isWaiting) {
@@ -233,19 +227,16 @@ async function handleStopChat(chatId, partnerId) {
   }
 
   await cleanupPair(chatId, partnerId);
-  await bot.sendMessage(chatId, "🛑 <b>Obrolan Dihentikan.</b>", MAIN_KEYBOARD);
-  await notifyUserQuietly(partnerId, "🛑 <b>Teman bicara kamu menghentikan obrolan.</b>", MAIN_KEYBOARD);
+  await bot.sendMessage(chatId, "🛑 <b>Obrolan Dihentikan.</b>\nKetik /random atau tekan tombol di bawah untuk mencari lagi.", MAIN_KEYBOARD);
+  await notifyUserQuietly(partnerId, "🛑 <b>Teman bicara kamu telah menghentikan obrolan.</b>", MAIN_KEYBOARD);
 }
 
-// Helper untuk Menghapus Pesan Pencarian
 async function deleteSearchMessage(userId) {
   const msgId = await redis.hget(SEARCH_MSG_HASH, userId);
   if (msgId) {
     try {
       await bot.deleteMessage(userId, msgId);
-    } catch (e) {
-      // Abaikan jika pesan sudah terlanjur dihapus user
-    }
+    } catch (e) {}
     await redis.hdel(SEARCH_MSG_HASH, userId);
   }
 }
