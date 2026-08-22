@@ -3,207 +3,210 @@ const { Redis } = require('@upstash/redis');
 
 const redis = Redis.fromEnv();
 const token = process.env.BOT_TOKEN;
-const secretToken = process.env.TELEGRAM_SECRET_TOKEN; // Secret token untuk keamanan Webhook
+const secretToken = process.env.TELEGRAM_SECRET_TOKEN;
 
 const bot = new TelegramBot(token);
 
-// Key Konstanta Redis
 const WAITING_SET = 'waiting_users';
 const PAIRS_HASH = 'pairs';
 
+// --- KEYBOARD TEMPLATES ---
+const MAIN_KEYBOARD = {
+  reply_markup: {
+    inline_keyboard: [
+      [{ text: "🎲 Cari Teman Chat", callback_data: "cmd_random" }]
+    ]
+  },
+  parse_mode: "HTML"
+};
+
+const CHATTING_KEYBOARD = {
+  reply_markup: {
+    inline_keyboard: [
+      [
+        { text: "🔄 Ganti Pasangan", callback_data: "cmd_next" },
+        { text: "🛑 Keluar Chat", callback_data: "cmd_stop" }
+      ]
+    ]
+  },
+  parse_mode: "HTML"
+};
+
+const QUEUE_KEYBOARD = {
+  reply_markup: {
+    inline_keyboard: [
+      [{ text: "❌ Batal Antre", callback_data: "cmd_stop" }]
+    ]
+  },
+  parse_mode: "HTML"
+};
+
 module.exports = async (req, res) => {
-  // 1. Keamanan Webhook: Hanya terima POST dan verifikasi Secret Token
-  if (req.method !== 'POST') {
-    return res.status(200).send('Vercel Anonymous Bot Engine Active!');
-  }
+  if (req.method !== 'POST') return res.status(200).send('Bot Active!');
 
   const incomingSecret = req.headers['x-telegram-bot-api-secret-token'];
   if (secretToken && incomingSecret !== secretToken) {
-    console.warn('Unauthorized request: Secret token mismatch');
     return res.status(403).send('Forbidden');
   }
 
   const update = req.body;
-  if (!update || !update.update_id) {
-    return res.status(200).send('OK');
-  }
+  if (!update || !update.update_id) return res.status(200).send('OK');
 
-  // 2. Deduplikasi Update ID (Mencegah Replay Event dari Telegram)
+  // Deduplikasi Update ID
   const updateKey = `processed_update:${update.update_id}`;
-  const isProcessed = await redis.set(updateKey, '1', { nx: true, ex: 86400 }); // TTL 24 jam
-  
-  if (!isProcessed) {
-    // Jika key sudah ada, update ini sudah pernah diproses
-    return res.status(200).send('OK');
-  }
+  const isProcessed = await redis.set(updateKey, '1', { nx: true, ex: 86400 });
+  if (!isProcessed) return res.status(200).send('OK');
 
-  // Hanya proses private chat message biasa (abaikan channel, edited_message, group, dll)
-  const msg = update.message;
-  if (!msg || !msg.chat || msg.chat.type !== 'private') {
-    return res.status(200).send('OK');
-  }
+  // -------------------------------------------------------------
+  // HANDLER 1: Klik Tombol Inline (Callback Query)
+  // -------------------------------------------------------------
+  if (update.callback_query) {
+    const cb = update.callback_query;
+    const chatId = cb.message.chat.id.toString();
+    const action = cb.data;
 
-  const chatId = msg.chat.id.toString();
-  const text = msg.text || '';
+    // Hilangkan efek loading tombol di Telegram
+    await bot.answerCallbackQuery(cb.id);
 
-  try {
-    // Ambil partner jika sedang dalam obrolan
     const partnerId = await redis.hget(PAIRS_HASH, chatId);
 
-    // --- COMMAND: /start ---
-    if (text === '/start') {
-      await bot.sendMessage(
-        chatId,
-        "🤖 *Selamat datang di Anonymous Chat Bot!*\n\n" +
-        "Gunakan perintah berikut:\n" +
-        "🎲 `/random` - Cari teman obrolan acak\n" +
-        "🔄 `/next` - Ganti ke teman obrolan baru\n" +
-        "🛑 `/stop` - Hentikan obrolan saat ini",
-        { parse_mode: "Markdown" }
-      );
-    } 
-
-    // --- COMMAND: /random ---
-    else if (text === '/random') {
+    if (action === 'cmd_random') {
       await handleRandomMatch(chatId, partnerId);
-    } 
-
-    // --- COMMAND: /stop ---
-    else if (text === '/stop') {
+    } else if (action === 'cmd_stop') {
       await handleStopChat(chatId, partnerId);
-    } 
-
-    // --- COMMAND: /next ---
-    else if (text === '/next') {
+    } else if (action === 'cmd_next') {
       if (partnerId) {
         await cleanupPair(chatId, partnerId);
-        await bot.sendMessage(chatId, "🔄 Obrolan dihentikan.");
-        await notifyUserQuietly(partnerId, "🛑 Teman bicara kamu telah meninggalkan obrolan. Ketik /random untuk cari pasangan baru.");
+        await bot.sendMessage(chatId, "🔄 <i>Obrolan sebelumnya dihentikan.</i>", { parse_mode: "HTML" });
+        await notifyUserQuietly(partnerId, "🛑 <i>Teman bicara kamu telah meninggalkan obrolan.</i>", MAIN_KEYBOARD);
       } else {
         await redis.srem(WAITING_SET, chatId);
       }
-      // Langsung cari partner baru
       await handleRandomMatch(chatId, null);
-    } 
+    }
+    return res.status(200).send('OK');
+  }
 
-    // --- RELAY PESAN (Teks, Media, Sticker, Voice, Document, dll) ---
-    else {
-      // Jika merupakan command yang tidak dikenali, abaikan
-      if (text.startsWith('/')) {
-        return res.status(200).send('OK');
+  // -------------------------------------------------------------
+  // HANDLER 2: Pesan Teks / Media Biasa
+  // -------------------------------------------------------------
+  const msg = update.message;
+  if (!msg || !msg.chat || msg.chat.type !== 'private') return res.status(200).send('OK');
+
+  const chatId = msg.chat.id.toString();
+  const text = msg.text || '';
+  const partnerId = await redis.hget(PAIRS_HASH, chatId);
+
+  // Command Teks Biasa
+  if (text === '/start') {
+    const welcomeMsg = 
+      "✨ <b>Selamat Datang di AnonChat Bot!</b> ✨\n\n" +
+      "Di sini kamu bisa ngobrol secara rahasia/anonim dengan pengguna lain secara acak.\n\n" +
+      "💡 <i>Privasi kamu aman. Identitas, username, dan foto profil tidak akan terlihat oleh teman bicara.</i>\n\n" +
+      "Tekan tombol di bawah untuk mulai mencari pasangan:";
+    await bot.sendMessage(chatId, welcomeMsg, MAIN_KEYBOARD);
+  } else if (text === '/random') {
+    await handleRandomMatch(chatId, partnerId);
+  } else if (text === '/stop') {
+    await handleStopChat(chatId, partnerId);
+  } else if (text === '/next') {
+    if (partnerId) {
+      await cleanupPair(chatId, partnerId);
+      await bot.sendMessage(chatId, "🔄 <i>Obrolan dihentikan.</i>", { parse_mode: "HTML" });
+      await notifyUserQuietly(partnerId, "🛑 <i>Teman bicara kamu meninggalkan obrolan.</i>", MAIN_KEYBOARD);
+    } else {
+      await redis.srem(WAITING_SET, chatId);
+    }
+    await handleRandomMatch(chatId, null);
+  } else {
+    // Relay Pesan Teks & Media
+    if (text.startsWith('/')) return res.status(200).send('OK');
+
+    if (partnerId) {
+      try {
+        await bot.copyMessage(partnerId, chatId, msg.message_id);
+      } catch (err) {
+        await cleanupPair(chatId, partnerId);
+        await bot.sendMessage(chatId, "⚠️ <i>Pasangan kamu telah memblokir bot atau keluar. Obrolan dihentikan.</i>", MAIN_KEYBOARD);
       }
-
-      if (partnerId) {
-        try {
-          await bot.copyMessage(partnerId, chatId, msg.message_id);
-        } catch (err) {
-          // Jika gagal kirim (misal partner blokir bot), bersihkan pair
-          console.error(`Gagal relay dari ${chatId} ke ${partnerId}:`, err.message);
-          await cleanupPair(chatId, partnerId);
-          await bot.sendMessage(chatId, "⚠️ Pasangan kamu tidak dapat menerima pesan (mungkin telah memblokir bot). Obrolan dihentikan.\nKetik /random untuk mencari pasangan baru.");
-        }
+    } else {
+      const isWaiting = await redis.sismember(WAITING_SET, chatId);
+      if (isWaiting) {
+        await bot.sendMessage(chatId, "⏳ <i>Kamu masih dalam antrean. Tekan Batal jika ingin keluar.</i>", QUEUE_KEYBOARD);
       } else {
-        const isWaiting = await redis.sismember(WAITING_SET, chatId);
-        if (isWaiting) {
-          await bot.sendMessage(chatId, "⏳ Kamu masih dalam antrean. Mohon tunggu pasangan acak...");
-        } else {
-          await bot.sendMessage(chatId, "⚠️ Kamu belum terhubung. Ketik /random untuk mencari teman chat.");
-        }
+        await bot.sendMessage(chatId, "⚠️ <i>Kamu belum terhubung dengan siapa pun.</i>", MAIN_KEYBOARD);
       }
     }
-  } catch (error) {
-    console.error("Error processing update:", error);
   }
 
   return res.status(200).send('OK');
 };
 
-// ==========================================
-// HELPER FUNCTIONS & LOGIK ATOMIC REDIS
-// ==========================================
-
-// Logika Matchmaking Atomic
+// --- LOGIKA MATCHMAKING DENGAN TAMPILAN BARU ---
 async function handleRandomMatch(chatId, existingPartnerId) {
   if (existingPartnerId) {
-    await bot.sendMessage(chatId, "⚠️ Kamu sedang dalam obrolan! Ketik /next untuk ganti atau /stop untuk keluar.");
+    await bot.sendMessage(chatId, "⚠️ <i>Kamu sedang dalam obrolan aktif!</i>", CHATTING_KEYBOARD);
     return;
   }
 
-  // Cek apakah user sudah ada di waiting queue
   const isWaiting = await redis.sismember(WAITING_SET, chatId);
   if (isWaiting) {
-    await bot.sendMessage(chatId, "⏳ Kamu sudah ada di antrean. Mohon tunggu...");
+    await bot.sendMessage(chatId, "⏳ <b>Sedang mencari pasangan...</b>\nMohon tunggu sebentar.", QUEUE_KEYBOARD);
     return;
   }
 
-  // Coba ambil 1 kandidat pasangan secara ATOMIC dari Set
   let matchedUser = await redis.spop(WAITING_SET);
-
-  // Jika kandidat yang ter-SPOP adalah diri sendiri (edge case), ganti penanganannya
-  if (matchedUser === chatId) {
-    matchedUser = await redis.spop(WAITING_SET);
-  }
+  if (matchedUser === chatId) matchedUser = await redis.spop(WAITING_SET);
 
   if (matchedUser) {
-    // Berhasil menemukan pasangan!
-    // Simpan pairing dua arah ke Redis Hash
-    await redis.hset(PAIRS_HASH, {
-      [chatId]: matchedUser,
-      [matchedUser]: chatId
-    });
+    await redis.hset(PAIRS_HASH, { [chatId]: matchedUser, [matchedUser]: chatId });
 
-    // Kirim notifikasi ke kedua belah pihak
-    const msgText = "🎉 Pasangan ditemukan! Selamat mengobrol.\nKetik /next untuk ganti, /stop untuk berhenti.";
-    await bot.sendMessage(chatId, msgText);
+    const matchText = 
+      "🎉 <b>Pasangan Ditemukan!</b>\n" +
+      "━━━━━━━━━━━━━━━━━━━\n" +
+      "Silakan menyapa teman barumu. Jaga kesopanan & selamat mengobrol!\n\n" +
+      "<i>Gunakan tombol di bawah untuk navigasi obrolan:</i>";
+
+    await bot.sendMessage(chatId, matchText, CHATTING_KEYBOARD);
     
-    const sent = await notifyUserQuietly(matchedUser, msgText);
+    const sent = await notifyUserQuietly(matchedUser, matchText, CHATTING_KEYBOARD);
     if (!sent) {
-      // Jika matchedUser gagal dikirimi pesan (misal memblokir bot), rollback pairing
       await cleanupPair(chatId, matchedUser);
-      await bot.sendMessage(chatId, "⚠️ Pasangan yang ditemukan tidak aktif/memblokir bot. Mencari pasangan lain...");
-      // Re-run pencarian untuk chatId
+      await bot.sendMessage(chatId, "⚠️ <i>Pasangan tidak merespon/memblokir bot. Mencari ulang...</i>", { parse_mode: "HTML" });
       await handleRandomMatch(chatId, null);
     }
   } else {
-    // Antrean kosong: Tambahkan chatId ke antrean secara ATOMIC
     await redis.sadd(WAITING_SET, chatId);
-    await bot.sendMessage(chatId, "🔍 Mencari teman obrolan...");
+    await bot.sendMessage(chatId, "🔍 <b>Mencari teman obrolan...</b>\nKami akan memberitahu jika pasangan sudah ditemukan.", QUEUE_KEYBOARD);
   }
 }
 
-// Logika Stop Chat
 async function handleStopChat(chatId, partnerId) {
-  // Cek jika sedang di antrean
   const removedFromQueue = await redis.srem(WAITING_SET, chatId);
   if (removedFromQueue) {
-    await bot.sendMessage(chatId, "🛑 Kamu telah keluar dari antrean.");
+    await bot.sendMessage(chatId, "🛑 <i>Kamu telah keluar dari antrean pencarian.</i>", MAIN_KEYBOARD);
     return;
   }
 
   if (!partnerId) {
-    await bot.sendMessage(chatId, "⚠️ Kamu sedang tidak terhubung dengan siapa pun.");
+    await bot.sendMessage(chatId, "⚠️ <i>Kamu sedang tidak dalam obrolan.</i>", MAIN_KEYBOARD);
     return;
   }
 
-  // Hapus pairing dari Redis
   await cleanupPair(chatId, partnerId);
-
-  await bot.sendMessage(chatId, "🛑 Obrolan dihentikan. Ketik /random untuk cari pasangan baru.");
-  await notifyUserQuietly(partnerId, "🛑 Teman bicara kamu telah menghentikan obrolan. Ketik /random untuk cari pasangan baru.");
+  await bot.sendMessage(chatId, "🛑 <b>Obrolan Dihentikan.</b>\nKetik /random atau tekan tombol di bawah untuk mencari lagi.", MAIN_KEYBOARD);
+  await notifyUserQuietly(partnerId, "🛑 <b>Teman bicara kamu menghentikan obrolan.</b>", MAIN_KEYBOARD);
 }
 
-// Helper untuk menghapus pair dua arah secara aman
 async function cleanupPair(userA, userB) {
   await redis.hdel(PAIRS_HASH, userA, userB);
 }
 
-// Helper pengiriman pesan yang aman jika target user menolak/block
-async function notifyUserQuietly(userId, text) {
+async function notifyUserQuietly(userId, text, keyboard = {}) {
   try {
-    await bot.sendMessage(userId, text);
+    await bot.sendMessage(userId, text, keyboard);
     return true;
   } catch (err) {
-    console.error(`Gagal mengirim notifikasi ke user ${userId}:`, err.message);
     return false;
   }
 }
