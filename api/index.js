@@ -11,9 +11,6 @@ const WAITING_SET = 'waiting_users';
 const PAIRS_HASH = 'pairs';
 const SEARCH_MSG_HASH = 'search_msgs';
 
-// Helper Key Redis untuk menyimpan ID pesan per percakapan
-const getChatHistoryKey = (userId) => `chat_history:${userId}`;
-
 const MAIN_KEYBOARD = {
   reply_markup: {
     inline_keyboard: [
@@ -76,12 +73,9 @@ module.exports = async (req, res) => {
       await handleStopChat(chatId, partnerId);
     } else if (action === 'cmd_next') {
       if (partnerId) {
-        // Hapus semua riwayat pesan antara kedua user sebelum memutus koneksi
-        await clearChatHistory(chatId, partnerId);
         await cleanupPair(chatId, partnerId);
-
-        await bot.sendMessage(chatId, "🔄 <i>Obrolan dihentikan & pesan dibersihkan. Mencari teman baru...</i>", { parse_mode: "HTML" });
-        await notifyUserQuietly(partnerId, "🛑 <i>Teman bicara kamu meninggalkan obrolan. Pesan telah dibersihkan.</i>", MAIN_KEYBOARD);
+        await bot.sendMessage(chatId, "🔄 <i>Obrolan dihentikan. Mencari teman baru...</i>", { parse_mode: "HTML" });
+        await notifyUserQuietly(partnerId, "🛑 <i>Teman bicara kamu meninggalkan obrolan.</i>", MAIN_KEYBOARD);
       } else {
         await handleCancelQueue(chatId);
       }
@@ -103,11 +97,11 @@ module.exports = async (req, res) => {
       "✨ <b>Selamat Datang di AnonChat Bot!</b> ✨\n" +
       "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
       "Ngobrol rahasia & anonim dengan pengguna lain secara acak.\n" +
-      "💡 <i>Identitas, username, & foto profil kamu dijamin tidak akan terlihat. Pesan otomatis terhapus saat obrolan dihentikan!</i>\n\n" +
+      "💡 <i>Identitas, username, & foto profil kamu dijamin tidak akan terlihat.</i>\n\n" +
       "📌 <b>Panduan & Fitur:</b>\n" +
       "• 🎲 <b>Cari Teman</b> - Mulai mencari obrolan acak\n" +
       "• 🔄 <b>Ganti Pasangan</b> - Pindah ke teman chat lain\n" +
-      "• 🛑 <b>Keluar Chat</b> - Mengakhiri obrolan & hapus seluruh riwayat chat\n\n" +
+      "• 🛑 <b>Keluar Chat</b> - Mengakhiri obrolan saat ini\n\n" +
       "👑 <b>Owner Bot:</b> @tatsukiray\n" +
       "━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
       "Tekan tombol di bawah untuk mencari pasangan:";
@@ -119,11 +113,9 @@ module.exports = async (req, res) => {
     await handleStopChat(chatId, partnerId);
   } else if (text === '/next') {
     if (partnerId) {
-      await clearChatHistory(chatId, partnerId);
       await cleanupPair(chatId, partnerId);
-
-      await bot.sendMessage(chatId, "🔄 <i>Obrolan dihentikan & pesan dibersihkan. Mencari teman baru...</i>", { parse_mode: "HTML" });
-      await notifyUserQuietly(partnerId, "🛑 <i>Teman bicara kamu meninggalkan obrolan. Pesan telah dibersihkan.</i>", MAIN_KEYBOARD);
+      await bot.sendMessage(chatId, "🔄 <i>Obrolan dihentikan. Mencari teman baru...</i>", { parse_mode: "HTML" });
+      await notifyUserQuietly(partnerId, "🛑 <i>Teman bicara kamu meninggalkan obrolan.</i>", MAIN_KEYBOARD);
     } else {
       await handleCancelQueue(chatId);
     }
@@ -133,16 +125,8 @@ module.exports = async (req, res) => {
 
     if (partnerId) {
       try {
-        // Simpan message_id pengirim
-        await trackMessage(chatId, msg.message_id);
-
-        // Teruskan pesan ke partner
-        const copiedMsg = await bot.copyMessage(partnerId, chatId, msg.message_id);
-
-        // Simpan message_id yang diterima partner
-        await trackMessage(partnerId, copiedMsg.message_id);
+        await bot.copyMessage(partnerId, chatId, msg.message_id);
       } catch (err) {
-        await clearChatHistory(chatId, partnerId);
         await cleanupPair(chatId, partnerId);
         await bot.sendMessage(chatId, "⚠️ <i>Pasangan memblokir bot/keluar. Obrolan dihentikan.</i>", MAIN_KEYBOARD);
       }
@@ -181,12 +165,10 @@ async function handleRandomMatch(chatId, existingPartnerId) {
     const matchText = 
       "🎉 <b>Pasangan Ditemukan!</b>\n" +
       "━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-      "Silakan menyapa teman barumu. Jaga kesopanan & selamat mengobrol!\n" +
-      "🗑️ <i>Semua riwayat chat akan otomatis terhapus saat stop.</i>\n\n" +
+      "Silakan menyapa teman barumu. Jaga kesopanan & selamat mengobrol!\n\n" +
       "👑 <i>Bot by @tatsukiray</i>";
 
-    const msg1 = await bot.sendMessage(chatId, matchText, CHATTING_KEYBOARD);
-    await trackMessage(chatId, msg1.message_id);
+    await bot.sendMessage(chatId, matchText, CHATTING_KEYBOARD);
     
     const sent = await notifyUserQuietly(matchedUser, matchText, CHATTING_KEYBOARD);
     if (!sent) {
@@ -197,6 +179,7 @@ async function handleRandomMatch(chatId, existingPartnerId) {
   } else {
     await redis.sadd(WAITING_SET, chatId);
 
+    // Animasi Text Loading Search
     const searchMsg = await bot.sendMessage(
       chatId, 
       "🔍 <b>Mencari teman obrolan</b> <code>.</code>\n<i>Mohon tunggu sebentar...</i>", 
@@ -243,45 +226,9 @@ async function handleStopChat(chatId, partnerId) {
     return;
   }
 
-  // Hapus semua riwayat percakapan kedua user
-  await clearChatHistory(chatId, partnerId);
   await cleanupPair(chatId, partnerId);
-
-  await bot.sendMessage(chatId, "🛑 <b>Obrolan Dihentikan.</b>\nSemua riwayat percakapan telah dibersihkan.", MAIN_KEYBOARD);
-  await notifyUserQuietly(partnerId, "🛑 <b>Teman bicara kamu telah menghentikan obrolan.</b>\nSemua riwayat percakapan telah dibersihkan.", MAIN_KEYBOARD);
-}
-
-// --- HELPER UNTUK TRACKING & PENGHAPUSAN CHAT ---
-
-// Simpan ID Pesan ke Redis List
-async function trackMessage(userId, messageId) {
-  const key = getChatHistoryKey(userId);
-  await redis.rpush(key, messageId);
-  await redis.expire(key, 86400); // Expiry 24 jam untuk jaga-jaga
-}
-
-// Hapus Seluruh Riwayat Pesan dari Kedua Belah Pihak
-async function clearChatHistory(userA, userB) {
-  const users = [userA, userB];
-
-  for (const userId of users) {
-    const key = getChatHistoryKey(userId);
-    const messageIds = await redis.lrange(key, 0, -1);
-
-    if (messageIds && messageIds.length > 0) {
-      // Telegram API mendukung penghapusan massal (hingga 100 pesan sekaligus)
-      // Jika menggunakan node-telegram-bot-api versi baru, deleteMessages bisa digunakan.
-      // Jika versi lama, kita loop secara individual menggunakan deleteMessage.
-      for (const msgId of messageIds) {
-        try {
-          await bot.deleteMessage(userId, parseInt(msgId));
-        } catch (e) {
-          // Abaikan error jika pesan sudah dihapus manual oleh user
-        }
-      }
-      await redis.del(key);
-    }
-  }
+  await bot.sendMessage(chatId, "🛑 <b>Obrolan Dihentikan.</b>\nKetik /random atau tekan tombol di bawah untuk mencari lagi.", MAIN_KEYBOARD);
+  await notifyUserQuietly(partnerId, "🛑 <b>Teman bicara kamu telah menghentikan obrolan.</b>", MAIN_KEYBOARD);
 }
 
 async function deleteSearchMessage(userId) {
@@ -300,8 +247,8 @@ async function cleanupPair(userA, userB) {
 
 async function notifyUserQuietly(userId, text, keyboard = {}) {
   try {
-    const sentMsg = await bot.sendMessage(userId, text, keyboard);
-    return sentMsg;
+    await bot.sendMessage(userId, text, keyboard);
+    return true;
   } catch (err) {
     return false;
   }
