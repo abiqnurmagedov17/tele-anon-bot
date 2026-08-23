@@ -62,6 +62,7 @@ module.exports = async (req, res) => {
     const cb = update.callback_query;
     const chatId = cb.message.chat.id.toString();
     const action = cb.data;
+    const messageId = cb.message.message_id;
 
     await bot.answerCallbackQuery(cb.id);
     const partnerId = await redis.hget(PAIRS_HASH, chatId);
@@ -69,9 +70,9 @@ module.exports = async (req, res) => {
     if (action === 'cmd_random') {
       await handleRandomMatch(chatId, partnerId);
     } else if (action === 'cmd_cancel_queue') {
-      await handleCancelQueue(chatId);
+      await handleCancelQueue(chatId, messageId);
     } else if (action === 'cmd_stop') {
-      await handleStopChat(chatId, partnerId);
+      await handleStopChat(chatId, partnerId, messageId);
     } else if (action === 'cmd_next') {
       if (partnerId) {
         await cleanupPair(chatId, partnerId);
@@ -111,7 +112,7 @@ module.exports = async (req, res) => {
   } else if (text === '/random') {
     await handleRandomMatch(chatId, partnerId);
   } else if (text === '/stop') {
-    await handleStopChat(chatId, partnerId);
+    await handleStopChat(chatId, partnerId, null);
   } else if (text === '/next') {
     if (partnerId) {
       await cleanupPair(chatId, partnerId);
@@ -158,17 +159,14 @@ async function handleRandomMatch(chatId, existingPartnerId) {
     return;
   }
 
-  // Mengambil calon pasangan dari Redis Set
   let matchedUser = await redis.spop(WAITING_SET);
 
-  // Jika yang ter-pop adalah diri sendiri, masukkan kembali dan batalkan match kali ini
   if (matchedUser === chatId) {
     await redis.sadd(WAITING_SET, chatId);
     matchedUser = null;
   }
 
   if (matchedUser) {
-    // Simpan pasangan dua arah
     await redis.hset(PAIRS_HASH, { [chatId]: matchedUser, [matchedUser]: chatId });
 
     const matchText = 
@@ -186,7 +184,6 @@ async function handleRandomMatch(chatId, existingPartnerId) {
       await handleRandomMatch(chatId, null);
     }
   } else {
-    // Masukkan ke antrean jika belum ada pasangan
     await redis.sadd(WAITING_SET, chatId);
 
     await bot.sendMessage(
@@ -197,15 +194,33 @@ async function handleRandomMatch(chatId, existingPartnerId) {
   }
 }
 
-async function handleCancelQueue(chatId) {
+async function handleCancelQueue(chatId, messageId = null) {
   await redis.srem(WAITING_SET, chatId);
+
+  if (messageId) {
+    try {
+      await bot.editMessageText(
+        "❌ <b>Pencarian dibatalkan.</b>\nTekan tombol di bawah untuk mencari kembali:",
+        {
+          chat_id: chatId,
+          message_id: messageId,
+          parse_mode: "HTML",
+          reply_markup: MAIN_KEYBOARD.reply_markup
+        }
+      );
+      return;
+    } catch (e) {
+      // Fallback jika pesan gagal di-edit
+    }
+  }
+
   await bot.sendMessage(chatId, "❌ <i>Pencarian dibatalkan.</i>", MAIN_KEYBOARD);
 }
 
-async function handleStopChat(chatId, partnerId) {
+async function handleStopChat(chatId, partnerId, messageId = null) {
   const isWaiting = await redis.sismember(WAITING_SET, chatId);
   if (isWaiting) {
-    await handleCancelQueue(chatId);
+    await handleCancelQueue(chatId, messageId);
     return;
   }
 
