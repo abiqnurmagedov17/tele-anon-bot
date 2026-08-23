@@ -5,11 +5,14 @@ const redis = Redis.fromEnv();
 const token = process.env.BOT_TOKEN;
 const secretToken = process.env.TELEGRAM_SECRET_TOKEN;
 
-// Matikan polling karena ini menggunakan Webhook Serverless
+// Matikan polling karena menggunakan Webhook Serverless
 const bot = new TelegramBot(token);
 
 const WAITING_SET = 'waiting_users';
 const PAIRS_HASH = 'pairs';
+const USERS_SET = 'all_users';
+
+const ADMIN_ID = '8646243735'; // User ID Admin
 
 const MAIN_KEYBOARD = {
   reply_markup: {
@@ -95,6 +98,9 @@ module.exports = async (req, res) => {
   const partnerId = await redis.hget(PAIRS_HASH, chatId);
 
   if (text === '/start') {
+    // Simpan userId ke Redis saat /start dipanggil
+    await redis.sadd(USERS_SET, chatId);
+
     const welcomeMsg = 
       "✨ <b>Selamat Datang di AnonChat Bot!</b> ✨\n" +
       "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
@@ -109,6 +115,20 @@ module.exports = async (req, res) => {
       "Tekan tombol di bawah untuk mencari pasangan:";
       
     await bot.sendMessage(chatId, welcomeMsg, MAIN_KEYBOARD);
+  } else if (text.startsWith('/broad')) {
+    // Verifikasi ID Admin (Aman meskipun username diubah)
+    if (chatId !== ADMIN_ID) {
+      await bot.sendMessage(chatId, "⛔ <i>Fitur ini khusus untuk Owner Bot.</i>", { parse_mode: "HTML" });
+      return res.status(200).send('OK');
+    }
+
+    const broadcastText = text.replace('/broad', '').trim();
+    if (!broadcastText) {
+      await bot.sendMessage(chatId, "⚠️ <i>Gunakan format: <code>/broad Teks Pesan</code></i>", { parse_mode: "HTML" });
+      return res.status(200).send('OK');
+    }
+
+    await handleBroadcast(chatId, broadcastText);
   } else if (text === '/random') {
     await handleRandomMatch(chatId, partnerId);
   } else if (text === '/stop') {
@@ -144,6 +164,37 @@ module.exports = async (req, res) => {
 
   return res.status(200).send('OK');
 };
+
+// --- BROADCAST LOGIC ---
+
+async function handleBroadcast(adminId, messageText) {
+  const allUsers = await redis.smembers(USERS_SET);
+  let successCount = 0;
+  let failedCount = 0;
+
+  await bot.sendMessage(adminId, `📢 <i>Memulai broadcast ke ${allUsers.length} pengguna...</i>`, { parse_mode: "HTML" });
+
+  const formattedMessage = `📢 <b>PENGUMUMAN</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n${messageText}`;
+
+  for (const targetId of allUsers) {
+    try {
+      await bot.sendMessage(targetId, formattedMessage, { parse_mode: "HTML" });
+      successCount++;
+    } catch (err) {
+      failedCount++;
+      // Otomatis hapus ID dari Redis jika pengguna memblokir bot (error 403 / 400)
+      if (err.response && (err.response.statusCode === 403 || err.response.statusCode === 400)) {
+        await redis.srem(USERS_SET, targetId);
+      }
+    }
+  }
+
+  await bot.sendMessage(
+    adminId, 
+    `✅ <b>Broadcast Selesai!</b>\n\n• Berhasil: <b>${successCount}</b>\n• Gagal/Diblock: <b>${failedCount}</b>`, 
+    { parse_mode: "HTML" }
+  );
+}
 
 // --- MATCHMAKING LOGIC ---
 
@@ -210,7 +261,7 @@ async function handleCancelQueue(chatId, messageId = null) {
       );
       return;
     } catch (e) {
-      // Fallback jika pesan gagal di-edit
+      // Fallback jika pesan gagal diedit
     }
   }
 
