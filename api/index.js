@@ -13,6 +13,7 @@ const PAIRS_HASH = 'pairs';
 const USERS_SET = 'all_users';
 
 const ADMIN_ID = '8646243735'; // User ID Admin
+const QUEUE_TIMEOUT_SECONDS = 60; // Timeout 1 menit
 
 const MAIN_KEYBOARD = {
   reply_markup: {
@@ -82,7 +83,7 @@ module.exports = async (req, res) => {
         await bot.sendMessage(chatId, "🔄 <i>Mencari teman baru...</i>", { parse_mode: "HTML" });
         await notifyUserQuietly(partnerId, "🛑 <i>Teman bicara kamu meninggalkan obrolan.</i>", MAIN_KEYBOARD);
       } else {
-        await redis.srem(WAITING_SET, chatId);
+        await removeFromQueue(chatId);
       }
       await handleRandomMatch(chatId, null);
     }
@@ -98,7 +99,6 @@ module.exports = async (req, res) => {
   const partnerId = await redis.hget(PAIRS_HASH, chatId);
 
   if (text === '/start') {
-    // Simpan userId ke Redis saat /start dipanggil
     await redis.sadd(USERS_SET, chatId);
 
     const welcomeMsg = 
@@ -116,7 +116,6 @@ module.exports = async (req, res) => {
       
     await bot.sendMessage(chatId, welcomeMsg, MAIN_KEYBOARD);
   } else if (text.startsWith('/broad')) {
-    // Verifikasi ID Admin (Aman meskipun username diubah)
     if (chatId !== ADMIN_ID) {
       await bot.sendMessage(chatId, "⛔ <i>Fitur ini khusus untuk Owner Bot.</i>", { parse_mode: "HTML" });
       return res.status(200).send('OK');
@@ -139,7 +138,7 @@ module.exports = async (req, res) => {
       await bot.sendMessage(chatId, "🔄 <i>Mencari teman baru...</i>", { parse_mode: "HTML" });
       await notifyUserQuietly(partnerId, "🛑 <i>Teman bicara kamu meninggalkan obrolan.</i>", MAIN_KEYBOARD);
     } else {
-      await redis.srem(WAITING_SET, chatId);
+      await removeFromQueue(chatId);
     }
     await handleRandomMatch(chatId, null);
   } else {
@@ -153,6 +152,9 @@ module.exports = async (req, res) => {
         await bot.sendMessage(chatId, "⚠️ <i>Pasangan memblokir bot/keluar. Obrolan dihentikan.</i>", MAIN_KEYBOARD);
       }
     } else {
+      const isExpired = await checkAndHandleQueueTimeout(chatId);
+      if (isExpired) return res.status(200).send('OK');
+
       const isWaiting = await redis.sismember(WAITING_SET, chatId);
       if (isWaiting) {
         await bot.sendMessage(chatId, "⏳ <i>Kamu masih dalam antrean pencarian...</i>", QUEUE_KEYBOARD);
@@ -182,7 +184,6 @@ async function handleBroadcast(adminId, messageText) {
       successCount++;
     } catch (err) {
       failedCount++;
-      // Otomatis hapus ID dari Redis jika pengguna memblokir bot (error 403 / 400)
       if (err.response && (err.response.statusCode === 403 || err.response.statusCode === 400)) {
         await redis.srem(USERS_SET, targetId);
       }
@@ -196,13 +197,16 @@ async function handleBroadcast(adminId, messageText) {
   );
 }
 
-// --- MATCHMAKING LOGIC ---
+// --- MATCHMAKING & QUEUE TIMEOUT LOGIC ---
 
 async function handleRandomMatch(chatId, existingPartnerId) {
   if (existingPartnerId) {
     await bot.sendMessage(chatId, "⚠️ <i>Kamu sedang dalam obrolan aktif!</i>", CHATTING_KEYBOARD);
     return;
   }
+
+  // Cek apakah antrean sebelumnya sudah kadaluarsa
+  await checkAndHandleQueueTimeout(chatId);
 
   const isWaiting = await redis.sismember(WAITING_SET, chatId);
   if (isWaiting) {
@@ -212,12 +216,25 @@ async function handleRandomMatch(chatId, existingPartnerId) {
 
   let matchedUser = await redis.spop(WAITING_SET);
 
-  if (matchedUser === chatId) {
-    await redis.sadd(WAITING_SET, chatId);
-    matchedUser = null;
+  // Jika calon pasangan yang ter-pop ternyata antreannya sudah kadaluarsa (> 1 menit)
+  while (matchedUser) {
+    if (matchedUser === chatId) {
+      matchedUser = null;
+      break;
+    }
+
+    const isMatchedUserExpired = await checkAndHandleQueueTimeout(matchedUser);
+    if (!isMatchedUserExpired) {
+      break; // Pasangan valid ditemukan
+    }
+
+    // Jika kadaluarsa, pop user berikutnya
+    matchedUser = await redis.spop(WAITING_SET);
   }
 
   if (matchedUser) {
+    await cleanupQueueTimer(chatId);
+    await cleanupQueueTimer(matchedUser);
     await redis.hset(PAIRS_HASH, { [chatId]: matchedUser, [matchedUser]: chatId });
 
     const matchText = 
@@ -235,18 +252,47 @@ async function handleRandomMatch(chatId, existingPartnerId) {
       await handleRandomMatch(chatId, null);
     }
   } else {
+    // Masukkan ke antrean dan set Timer TTL 60 detik
     await redis.sadd(WAITING_SET, chatId);
+    await redis.set(`queue_timer:${chatId}`, Date.now().toString(), { ex: QUEUE_TIMEOUT_SECONDS });
 
     await bot.sendMessage(
       chatId, 
-      "🔍 <b>Mencari teman obrolan...</b>\n<i>Mohon tunggu sebentar sampai ada pengguna lain.</i>", 
+      "🔍 <b>Mencari teman obrolan...</b>\n<i>Mohon tunggu sebentar sampai ada pengguna lain (Maks 1 Menit).</i>", 
       QUEUE_KEYBOARD
     );
   }
 }
 
-async function handleCancelQueue(chatId, messageId = null) {
+async function checkAndHandleQueueTimeout(chatId) {
+  const isWaiting = await redis.sismember(WAITING_SET, chatId);
+  if (!isWaiting) return false;
+
+  const timerExists = await redis.exists(`queue_timer:${chatId}`);
+  if (!timerExists) {
+    // Timer expired (> 60 detik) -> Otomatis keluarkan dari antrean
+    await removeFromQueue(chatId);
+    await bot.sendMessage(
+      chatId, 
+      "⏳ <b>Pencarian Waktu Habis!</b>\n<i>Tidak ada pasangan yang ditemukan dalam 1 menit. Silakan coba cari lagi.</i>", 
+      MAIN_KEYBOARD
+    );
+    return true;
+  }
+  return false;
+}
+
+async function removeFromQueue(chatId) {
   await redis.srem(WAITING_SET, chatId);
+  await cleanupQueueTimer(chatId);
+}
+
+async function cleanupQueueTimer(chatId) {
+  await redis.del(`queue_timer:${chatId}`);
+}
+
+async function handleCancelQueue(chatId, messageId = null) {
+  await removeFromQueue(chatId);
 
   if (messageId) {
     try {
